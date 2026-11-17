@@ -9,7 +9,7 @@ def extract_id(url):
  return m.group(1)
 def fetch_range(url,start,end):
  with requests.get(url,headers={"Range":f"bytes={start}-{end}"},stream=True,timeout=(30,180)) as r:
-  if r.status_code not in (200,206):raise RuntimeError(f"Drive HTTP {r.status_code}")
+  if r.status_code != 206:raise RuntimeError(f"Drive did not honor byte range (HTTP {r.status_code}); refusing to download whole file")
   b=r.content
   if len(b)!=end-start+1:raise RuntimeError("Drive byte-range response mismatch; link permission/range support check karein")
   return b
