@@ -1,10 +1,10 @@
 import os,uuid
 from flask import Flask,request,jsonify,render_template
 from dotenv import load_dotenv
+load_dotenv()
 import db
 from transfer import launch,resume_active
 from storage import get_s3,bucket_name
-load_dotenv()
 app=Flask(__name__);db.init_db()
 def authorized():
  expected=os.getenv("ADMIN_API_KEY","")
