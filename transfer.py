@@ -2,8 +2,13 @@ import re,math,os,requests,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from storage import get_s3,bucket_name
 import db
-CHUNK=max(5,int(os.getenv("TRANSFER_PART_SIZE_MB","64")))*1024*1024
-WORKERS=max(1,min(4,int(os.getenv("TRANSFER_WORKERS","2"))))
+def env_int(name,default,minimum,maximum=None):
+ try:value=int(os.getenv(name,str(default)))
+ except (TypeError,ValueError):value=default
+ value=max(minimum,value)
+ return min(maximum,value) if maximum is not None else value
+CHUNK=env_int("TRANSFER_PART_SIZE_MB",64,5,512)*1024*1024
+WORKERS=env_int("TRANSFER_WORKERS",2,1,4)
 active=set();active_lock=threading.Lock()
 def extract_id(url):
  m=re.search(r"/file/d/([A-Za-z0-9_-]+)",url) or re.search(r"[?&]id=([A-Za-z0-9_-]+)",url)
@@ -43,6 +48,7 @@ def run_job(jid):
    for p in page.get("Parts",[]):remote[p["PartNumber"]]=p
    if not page.get("IsTruncated"):break
    marker=page["NextPartNumberMarker"]
+  db.delete_parts_not_in(jid,list(remote.keys()))
   saved={p["part_number"]:p for p in db.get_parts(jid)}
   for n,p in remote.items():
    if n not in saved or saved[n]["etag"]!=p["ETag"]:db.save_part(jid,n,p["ETag"],p["Size"])
@@ -61,7 +67,10 @@ def run_job(jid):
     db.update(jid,uploaded_bytes=size,progress=round(size*100/total,2),message=f"Uploaded {len(parts)}/{count} parts")
   parts=db.get_parts(jid)
   if len(parts)!=count:raise RuntimeError("Multipart parts missing after upload")
-  s3.complete_multipart_upload(Bucket=bucket_name(),Key=key,UploadId=upload_id,MultipartUpload={"Parts":[{"PartNumber":p["part_number"],"ETag":p["etag"]} for p in parts]})
+  ordered=sorted(parts,key=lambda p:p["part_number"])
+  if [p["part_number"] for p in ordered]!=list(range(1,count+1)):
+   raise RuntimeError("Multipart part sequence is incomplete; resume the job")
+  s3.complete_multipart_upload(Bucket=bucket_name(),Key=key,UploadId=upload_id,MultipartUpload={"Parts":[{"PartNumber":p["part_number"],"ETag":p["etag"]} for p in ordered]})
   db.update(jid,status="completed",progress=100,uploaded_bytes=total,upload_id=None,message="Transfer complete")
  except Exception as e:db.update(jid,status="failed",message=str(e))
  finally:
