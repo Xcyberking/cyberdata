@@ -1,47 +1,71 @@
-import re,math,os,requests
+import re,math,os,requests,threading
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from storage import get_s3,bucket_name
-CHUNK=int(os.getenv("TRANSFER_PART_SIZE_MB","64"))*1024*1024
+import db
+CHUNK=max(5,int(os.getenv("TRANSFER_PART_SIZE_MB","64")))*1024*1024
 WORKERS=max(1,min(4,int(os.getenv("TRANSFER_WORKERS","2"))))
+active=set();active_lock=threading.Lock()
 def extract_id(url):
  m=re.search(r"/file/d/([A-Za-z0-9_-]+)",url) or re.search(r"[?&]id=([A-Za-z0-9_-]+)",url)
- if not m:raise ValueError("Google Drive link se file ID nahi mila")
+ if not m:raise ValueError("Google Drive URL me file ID nahi mila")
  return m.group(1)
-def fetch_range(url,start,end):
- with requests.get(url,headers={"Range":f"bytes={start}-{end}"},stream=True,timeout=(30,180)) as r:
-  if r.status_code != 206:raise RuntimeError(f"Drive did not honor byte range (HTTP {r.status_code}); refusing to download whole file")
-  b=r.content
-  if len(b)!=end-start+1:raise RuntimeError("Drive byte-range response mismatch; link permission/range support check karein")
-  return b
-def start_transfer(jid,drive_url,key,jobs,lock):
- upload_id=None
- def upd(**kw):
-  with lock:jobs[jid].update(kw)
+def drive_url(url):return "https://drive.google.com/uc?export=download&id="+extract_id(url)
+def probe(url):
+ with requests.get(url,headers={"Range":"bytes=0-0"},stream=True,timeout=(30,90),allow_redirects=True) as r:
+  if r.status_code!=206:raise RuntimeError("Google Drive byte-range support unavailable (HTTP %s). Refusing whole-file buffering."%r.status_code)
+  cr=r.headers.get("Content-Range","")
+  if not cr.startswith("bytes 0-0/"):raise RuntimeError("Drive Content-Range invalid; check sharing, confirmation page, or Drive API authentication.")
+  return int(cr.rsplit("/",1)[1])
+def get_range(url,start,end):
+ with requests.get(url,headers={"Range":f"bytes={start}-{end}"},stream=True,timeout=(30,300),allow_redirects=True) as r:
+  if r.status_code!=206 or not r.headers.get("Content-Range","").startswith(f"bytes {start}-{end}/"):
+   raise RuntimeError("Drive did not return the requested byte range")
+  chunks=[];size=0
+  for chunk in r.iter_content(1024*1024):
+   if chunk:chunks.append(chunk);size+=len(chunk)
+  if size!=end-start+1:raise RuntimeError("Incomplete Drive range: expected %d bytes, received %d"%(end-start+1,size))
+  return b"".join(chunks)
+def run_job(jid):
+ with active_lock:
+  if jid in active:return
+  active.add(jid)
  try:
-  url=f"https://drive.google.com/uc?export=download&id={extract_id(drive_url)}"
-  with requests.get(url,headers={"Range":"bytes=0-0"},stream=True,timeout=(30,90)) as p:
-   if p.status_code not in (200,206):raise RuntimeError(f"Drive probe HTTP {p.status_code}")
-   cr=p.headers.get("Content-Range","")
-   if "/" not in cr:raise RuntimeError("Drive size/range metadata unavailable. File may need authenticated Drive API or confirmation.")
-   total=int(cr.rsplit("/",1)[1])
-  s3=get_s3()
-  upload_id=s3.create_multipart_upload(Bucket=bucket_name(),Key=key,ContentType="application/json")["UploadId"]
-  count=math.ceil(total/CHUNK)
-  upd(status="running",total_bytes=total,uploaded_bytes=0,total_parts=count,message="Streaming Drive bytes to Hugging Face")
-  parts=[];done=0
+  j=db.get_job(jid)
+  if not j:return
+  url=drive_url(j["drive_url"]);total=probe(url);key=j["object_key"];s3=get_s3();upload_id=j.get("upload_id")
+  if not upload_id:
+   upload_id=s3.create_multipart_upload(Bucket=bucket_name(),Key=key,ContentType="application/json")["UploadId"]
+   db.update(jid,upload_id=upload_id,total_bytes=total,total_parts=math.ceil(total/CHUNK),status="running")
+  elif j.get("total_bytes") and int(j["total_bytes"])!=total:raise RuntimeError("Drive source size changed; start a new job")
+  remote={};marker=0
+  while True:
+   page=s3.list_parts(Bucket=bucket_name(),Key=key,UploadId=upload_id,PartNumberMarker=marker)
+   for p in page.get("Parts",[]):remote[p["PartNumber"]]=p
+   if not page.get("IsTruncated"):break
+   marker=page["NextPartNumberMarker"]
+  saved={p["part_number"]:p for p in db.get_parts(jid)}
+  for n,p in remote.items():
+   if n not in saved or saved[n]["etag"]!=p["ETag"]:db.save_part(jid,n,p["ETag"],p["Size"])
+  saved={p["part_number"]:p for p in db.get_parts(jid)}
+  count=math.ceil(total/CHUNK);done=sum(p["size"] for p in saved.values())
+  db.update(jid,status="running",total_bytes=total,total_parts=count,uploaded_bytes=done,progress=round(done*100/total,2),message="Resuming missing chunks")
   def part(n):
-   a=(n-1)*CHUNK;b=min(total-1,a+CHUNK-1);body=fetch_range(url,a,b)
+   a=(n-1)*CHUNK;b=min(total-1,a+CHUNK-1);body=get_range(url,a,b)
    x=s3.upload_part(Bucket=bucket_name(),Key=key,UploadId=upload_id,PartNumber=n,Body=body)
-   return {"PartNumber":n,"ETag":x["ETag"],"size":len(body)}
+   db.save_part(jid,n,x["ETag"],len(body))
+  missing=[n for n in range(1,count+1) if n not in saved]
   with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-   fs=[pool.submit(part,n) for n in range(1,count+1)]
-   for f in as_completed(fs):
-    x=f.result();parts.append({"PartNumber":x["PartNumber"],"ETag":x["ETag"]});done+=x["size"]
-    upd(uploaded_bytes=done,progress=round(done*100/total,2),message=f"Uploaded part {len(parts)}/{count}")
-  s3.complete_multipart_upload(Bucket=bucket_name(),Key=key,UploadId=upload_id,MultipartUpload={"Parts":sorted(parts,key=lambda x:x["PartNumber"])})
-  upd(status="completed",progress=100,uploaded_bytes=total,message="Transfer complete")
- except Exception as e:
-  if upload_id:
-   try:get_s3().abort_multipart_upload(Bucket=bucket_name(),Key=key,UploadId=upload_id)
-   except Exception:pass
-  upd(status="failed",message=str(e))
+   futures=[pool.submit(part,n) for n in missing]
+   for f in as_completed(futures):
+    f.result();parts=db.get_parts(jid);size=sum(p["size"] for p in parts)
+    db.update(jid,uploaded_bytes=size,progress=round(size*100/total,2),message=f"Uploaded {len(parts)}/{count} parts")
+  parts=db.get_parts(jid)
+  if len(parts)!=count:raise RuntimeError("Multipart parts missing after upload")
+  s3.complete_multipart_upload(Bucket=bucket_name(),Key=key,UploadId=upload_id,MultipartUpload={"Parts":[{"PartNumber":p["part_number"],"ETag":p["etag"]} for p in parts]})
+  db.update(jid,status="completed",progress=100,uploaded_bytes=total,upload_id=None,message="Transfer complete")
+ except Exception as e:db.update(jid,status="failed",message=str(e))
+ finally:
+  with active_lock:active.discard(jid)
+def launch(jid):threading.Thread(target=run_job,args=(jid,),daemon=True).start()
+def resume_active():
+ for j in db.list_active():launch(j["id"])
