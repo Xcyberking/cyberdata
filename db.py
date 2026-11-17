@@ -32,3 +32,8 @@ def save_part(jid,n,etag,size):
  with conn() as c:c.execute("INSERT OR REPLACE INTO parts(job_id,part_number,etag,size) VALUES(?,?,?,?)",(jid,n,etag,size))
 def get_parts(jid):
  with conn() as c:return [dict(r) for r in c.execute("SELECT * FROM parts WHERE job_id=? ORDER BY part_number",(jid,))]
+def delete_parts_not_in(jid,part_numbers):
+ with conn() as c:
+  if not part_numbers:c.execute("DELETE FROM parts WHERE job_id=?",(jid,));return
+  marks=",".join("?" for _ in part_numbers)
+  c.execute(f"DELETE FROM parts WHERE job_id=? AND part_number NOT IN ({marks})",(jid,*part_numbers))
