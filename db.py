@@ -1,10 +1,15 @@
 import os,sqlite3
+from contextlib import contextmanager
 DB_PATH=os.getenv("DATABASE_PATH","/data/cyberdata.sqlite")
+@contextmanager
 def conn():
  os.makedirs(os.path.dirname(DB_PATH) or ".",exist_ok=True)
  c=sqlite3.connect(DB_PATH,timeout=30);c.row_factory=sqlite3.Row
- c.execute("PRAGMA journal_mode=WAL");c.execute("PRAGMA synchronous=FULL")
- return c
+ try:
+  c.execute("PRAGMA journal_mode=WAL");c.execute("PRAGMA synchronous=FULL")
+  yield c
+  c.commit()
+ finally:c.close()
 def init_db():
  with conn() as c:
   c.execute("""CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,drive_url TEXT NOT NULL,object_key TEXT NOT NULL,status TEXT NOT NULL,progress REAL DEFAULT 0,total_bytes INTEGER DEFAULT 0,uploaded_bytes INTEGER DEFAULT 0,total_parts INTEGER DEFAULT 0,upload_id TEXT,message TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
