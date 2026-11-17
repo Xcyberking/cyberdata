@@ -1,0 +1,30 @@
+name: CyberData checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  syntax-and-db:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m compileall -q .
+      - name: SQLite checkpoint smoke test
+        run: |
+          DATABASE_PATH=/tmp/cyberdata-test.sqlite python - <<'PY'
+          import db
+          db.init_db()
+          db.create_job("test-job", "https://drive.google.com/file/d/demo/view", "smoke.json")
+          assert db.get_job("test-job")["status"] == "queued"
+          db.save_part("test-job", 1, '"etag"', 5)
+          assert db.get_parts("test-job")[0]["size"] == 5
+          db.update("test-job", status="running", progress=50)
+          assert db.get_job("test-job")["progress"] == 50
+          print("SQLite checkpoint smoke test passed")
+          PY
